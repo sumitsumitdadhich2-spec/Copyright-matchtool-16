@@ -27,7 +27,7 @@ export function ModelBoard({ scan, usage }: { scan: Scan | null; usage: Record<s
             ? live.usedToday
             : (usage?.[m.id] ?? (typeof live?.usedToday === 'number' ? live.usedToday : 0))
           const exhausted = used >= m.rpd
-          const state: ModelLiveState['state'] = exhausted ? 'exhausted' : live?.state || 'idle'
+          const state: ModelLiveState['state'] = exhausted ? 'exhausted' : (live?.state === 'exhausted' ? 'cooling' : live?.state || 'idle')
           const badge = STATE_LABEL[state] || STATE_LABEL.idle
           const pct = Math.min(100, Math.round((used / m.rpd) * 100))
           return (

@@ -8,7 +8,7 @@ import { getAllUserApiKeys } from '@/lib/user-keys'
 import { extractClipPrecise } from '@/lib/ffmpeg'
 import { uploadVideo, deleteFileQuiet, rescanRequest, parseRescanMatch, classifyError } from '@/lib/gemini'
 import { globalGeminiCoordinator, type CandidateLane } from '@/lib/global-gemini-coordinator'
-import { CHUNK_COOLDOWN_MS } from '@/lib/models'
+import { CHUNK_COOLDOWN_MS, getModelDailyCap } from '@/lib/models'
 import { sameShortSegment, applyGroupMatches } from '@/lib/candidate-pick'
 import { invalidateRenderedOutput } from '@/lib/render'
 import { fmtTime } from '@/lib/format'
@@ -103,7 +103,7 @@ export async function POST(
         apiKey: k,
         keyIdx: ki + 1,
         modelId: mId,
-        rpd: 20,
+        rpd: getModelDailyCap(mId),
       })),
     )
 
@@ -159,7 +159,7 @@ export async function POST(
             selectedLane.apiKey,
             selectedLane.modelId,
             0,
-            selectedLane.rpd || 20,
+            selectedLane.rpd || getModelDailyCap(selectedLane.modelId),
             ge.kind === 'rpd',
           )
           addLog(scan, 'warn', `[Rescan Scene] ${outcome.reason} (attempt ${attempt}/${maxRescanAttempts})`)

@@ -94,6 +94,14 @@ export const MODEL_POOL: ModelSpec[] = [
   ...PADDED_VERIFY_MODEL_POOL,
 ].filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
 
+/** Returns the configured daily quota (RPD) for a model, defaulting safely to spec */
+export function getModelDailyCap(modelId: string): number {
+  const spec = MODEL_POOL.find((m) => m.id === modelId)
+  if (spec && typeof spec.rpd === 'number') return spec.rpd
+  if (modelId.includes('lite') || modelId.includes('3.5-flash')) return 500
+  return 20
+}
+
 /** Is this model one of the three locked chunk-map models? */
 export function isChunkModel(id: string): boolean {
   return CHUNK_MODEL_POOL.some((m) => m.id === id)

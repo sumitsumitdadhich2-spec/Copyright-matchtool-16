@@ -10,7 +10,7 @@ import {
   CHUNK_MAP_SANITIZED_PROMPT,
   type UploadProgress,
 } from './gemini'
-import { CHUNK_MODEL_POOL, CHUNK_COOLDOWN_MS } from './models'
+import { CHUNK_MODEL_POOL, CHUNK_COOLDOWN_MS, getModelDailyCap } from './models'
 import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute, preparePrescanMovieCopy } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
 import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage, apiKeyHash } from './store'
@@ -547,7 +547,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 selected.apiKey,
                 selected.modelId,
                 0,
-                selected.rpd || 20,
+                selected.rpd || getModelDailyCap(selected.modelId),
                 re.kind === 'rpd',
               )
               addLog(
@@ -730,7 +730,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 selected.apiKey,
                 selected.modelId,
                 0,
-                selected.rpd || 20,
+                selected.rpd || getModelDailyCap(selected.modelId),
                 re.kind === 'rpd',
               )
               addLog(

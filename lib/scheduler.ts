@@ -15,6 +15,7 @@ import {
   CHUNK_SECONDS,
   pacingIntervalMs,
   type ModelSpec,
+  getModelDailyCap,
 } from './models'
 import {
   getScan,
@@ -1643,15 +1644,16 @@ class Scheduler {
           addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — disabled for this scan; group ${g.id} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
           // EXACT SAME SYSTEM AS CHUNKS:
+          const modelCap = m.rpd || getModelDailyCap(m.id)
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             0,
-            m.rpd || 500,
+            modelCap,
             e.kind === 'rpd',
           )
           if (quotaOutcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+            setModelExhausted(m.id, lane.apiKey, modelCap)
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
@@ -1803,15 +1805,16 @@ class Scheduler {
         const e = err instanceof GeminiError ? err : classifyError(err)
         if (e.kind === 'rate' || e.kind === 'rpd') {
           hasRateError = true
+          const modelCap = m.rpd || getModelDailyCap(m.id)
           const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             0,
-            m.rpd || 500,
+            modelCap,
             e.kind === 'rpd',
           )
           if (outcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+            setModelExhausted(m.id, lane.apiKey, modelCap)
             st.state = 'exhausted'
           } else {
             job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
@@ -2653,15 +2656,16 @@ class Scheduler {
           job.queue.push(chunkIndex)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
+          const modelCap = m.rpd || getModelDailyCap(m.id)
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             0,
-            m.rpd || 20,
+            modelCap,
             e.kind === 'rpd',
           )
           if (quotaOutcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+            setModelExhausted(m.id, lane.apiKey, modelCap)
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)

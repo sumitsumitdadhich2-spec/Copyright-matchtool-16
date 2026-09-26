@@ -4,11 +4,12 @@ import {
   apiKeyHash,
   getModelUsage,
   setModelExhausted,
+  clearModelExhausted,
   isModelDailyQuotaExhausted,
   geminiUsageDay,
   checkDailyReset,
 } from './store'
-import { pacingIntervalMs, CHUNK_COOLDOWN_MS, displayModelName } from './models'
+import { pacingIntervalMs, CHUNK_COOLDOWN_MS, displayModelName, getModelDailyCap } from './models'
 
 export interface CandidateLane {
   apiKey: string
@@ -25,6 +26,20 @@ interface LaneWaiter {
   resolve: (releaseFn: (actualVideoSec?: number, cooldownOverrideMs?: number) => void) => void
   reject: (err: Error) => void
   isStopping?: () => boolean
+}
+
+interface VerifierTicket {
+  id: string
+  scanId: string
+  scanTitle: string
+  operation: string
+  candidates: CandidateLane[]
+  videoSeconds: number
+  onWait?: (msg: string, waitSec: number, candidateSummary: string) => void
+  isStopping?: () => boolean
+  resolve: (res: { selected: CandidateLane; release: (actualVideoSec?: number, cooldownOverrideMs?: number) => void }) => void
+  reject: (err: Error) => void
+  queuedAt: number
 }
 
 interface GlobalLaneState {
@@ -53,12 +68,19 @@ class GlobalGeminiCoordinator {
 
   /** Total verifier + rescan requests currently active / in-flight across ALL scans */
   private activeVerifyRescanCount = 0
+  /** Set of API key hashes currently running an active verifier or rescan (strictly max 1 per key) */
+  private activeVerifyRescanKeys = new Set<string>()
   /** Maximum simultaneous verifier + rescan requests allowed globally across all scans combined */
-  private readonly MAX_GLOBAL_VERIFY_RESCAN = 3
+  private readonly MAX_GLOBAL_VERIFY_RESCAN = 1
   /** Timestamp of the last outgoing verifier/rescan dispatch across any scan */
   private lastGlobalVerifyDispatchAt = 0
-  /** Minimum spacing (ms) between any two outgoing verifier/rescan dispatches across all scans */
-  private readonly GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS = 2000
+  /** Minimum spacing (ms) between any two outgoing verifier/rescan dispatches across all scans (anti-burst) */
+  private readonly GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS = 6000
+
+  /** Central Verifier & Rescan ticket queue — coordinates all parallel scans from above */
+  private verifierQueue: VerifierTicket[] = []
+  private isPumpingVerifierQueue = false
+  private verifierPumpTimer: NodeJS.Timeout | null = null
 
   /**
    * Checks if an operation is a Verifier or Rescan (NOT chunk mapping).
@@ -74,24 +96,192 @@ class GlobalGeminiCoordinator {
   }
 
   /**
+   * Remote Central Conductor for Verifier & Rescan:
+   * Coordinates all verifier and rescan requests across all parallel scans from a single high-level queue.
+   * Ensures:
+   * 1. Strictly at most 1 verifier/rescan per API key at a time (protects 250k TPM).
+   * 2. Strictly at most MAX_GLOBAL_VERIFY_RESCAN across all scans combined.
+   * 3. Minimum 6.0s spacing between any two outgoing dispatches (anti-burst).
+   * 4. When cooldown ends, requests dispatch ONE BY ONE sequentially with spacing (no stampede).
+   */
+  public pumpVerifierQueue(): void {
+    if (this.isPumpingVerifierQueue) return
+    this.isPumpingVerifierQueue = true
+
+    try {
+      if (this.verifierQueue.length === 0) return
+
+      // Clean up stopped / cancelled tickets
+      this.verifierQueue = this.verifierQueue.filter((t) => {
+        if (t.isStopping && t.isStopping()) {
+          t.reject(new Error('Stop requested — verifier ticket cancelled'))
+          return false
+        }
+        return true
+      })
+
+      if (this.verifierQueue.length === 0) return
+
+      this.checkDayRollover()
+
+      // Concurrency check: max active verifier/rescan
+      if (this.activeVerifyRescanCount >= this.MAX_GLOBAL_VERIFY_RESCAN) {
+        return
+      }
+
+      // Stagger dispatch gap check: min 6.0s between outgoing dispatches across all scans
+      const now = Date.now()
+      const gapNeeded = (this.lastGlobalVerifyDispatchAt + this.GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS) - now
+      if (gapNeeded > 0) {
+        if (this.verifierPumpTimer) clearTimeout(this.verifierPumpTimer)
+        this.verifierPumpTimer = setTimeout(() => {
+          this.verifierPumpTimer = null
+          this.pumpVerifierQueue()
+        }, gapNeeded + 50)
+        return
+      }
+
+      // Find first eligible ticket and candidate lane
+      let targetIdx = -1
+      let chosenCand: CandidateLane | null = null
+      let chosenLane: GlobalLaneState | null = null
+
+      for (let i = 0; i < this.verifierQueue.length; i++) {
+        const ticket = this.verifierQueue[i]
+        const availableCands = ticket.candidates.filter(
+          (c) => !this.isModelExhausted(c.apiKey, c.modelId, c.rpd),
+        )
+
+        if (availableCands.length === 0) {
+          ticket.reject(new Error('All candidate keys/models have reached their daily quota in Settings'))
+          this.verifierQueue.splice(i, 1)
+          i--
+          continue
+        }
+
+        // Sort: prioritize key with least usage, and model with least usage
+        availableCands.sort((a, b) => {
+          if (a.keyIdx !== b.keyIdx) return a.keyIdx - b.keyIdx
+          return getModelUsage(a.modelId, a.apiKey) - getModelUsage(b.modelId, b.apiKey)
+        })
+
+        for (const cand of availableCands) {
+          const kh = apiKeyHash(cand.apiKey)
+          // Strictly NO concurrent verifier on the same API key!
+          if (this.activeVerifyRescanKeys.has(kh)) continue
+
+          const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
+          const isFree =
+            lane.activeScanId === null &&
+            lane.cooldownUntil <= now &&
+            lane.nextFreeAt <= now
+
+          if (isFree) {
+            targetIdx = i
+            chosenCand = cand
+            chosenLane = lane
+            break
+          }
+        }
+
+        if (chosenCand && chosenLane) break
+      }
+
+      if (targetIdx !== -1 && chosenCand && chosenLane) {
+        const [ticket] = this.verifierQueue.splice(targetIdx, 1)
+        const kh = apiKeyHash(chosenCand.apiKey)
+
+        // ATOMIC CLAIM: lock immediately synchronously before any yield
+        this.activeVerifyRescanCount++
+        this.activeVerifyRescanKeys.add(kh)
+        this.lastGlobalVerifyDispatchAt = Date.now()
+
+        chosenLane.activeScanId = ticket.scanId
+        chosenLane.activeScanTitle = ticket.scanTitle
+        chosenLane.activeOperation = ticket.operation
+        chosenLane.activeSince = Date.now()
+
+        const selected = chosenCand
+        const laneRef = chosenLane
+
+        const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          this.activeVerifyRescanCount = Math.max(0, this.activeVerifyRescanCount - 1)
+          this.activeVerifyRescanKeys.delete(kh)
+          this.lastGlobalVerifyDispatchAt = Date.now()
+
+          this.releaseLane(laneRef, actualVideoSec ?? ticket.videoSeconds, cooldownOverrideMs)
+
+          // Trigger next ticket pump after a small buffer
+          setTimeout(() => {
+            this.pumpVerifierQueue()
+          }, 1500)
+        }
+
+        ticket.resolve({ selected, release })
+
+        // If more tickets waiting, schedule next dispatch after stagger gap
+        if (this.verifierQueue.length > 0) {
+          if (this.verifierPumpTimer) clearTimeout(this.verifierPumpTimer)
+          this.verifierPumpTimer = setTimeout(() => {
+            this.verifierPumpTimer = null
+            this.pumpVerifierQueue()
+          }, this.GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS + 100)
+        }
+        return
+      }
+
+      // No lane currently free: find shortest cooldown among queued tickets to schedule next wake-up
+      let shortestWait = Infinity
+      for (const ticket of this.verifierQueue) {
+        for (const cand of ticket.candidates) {
+          const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
+          if (lane.cooldownUntil > now && lane.cooldownUntil < shortestWait) {
+            shortestWait = lane.cooldownUntil
+          }
+        }
+      }
+
+      if (shortestWait < Infinity) {
+        const waitMs = shortestWait - now
+        const waitSec = Math.max(1, Math.ceil(waitMs / 1000))
+        for (const ticket of this.verifierQueue) {
+          ticket.onWait?.(
+            `[Global Verifier Conductor] Central queue: Model cooling down (~${waitSec}s remaining). Staggering dispatches across parallel scans to prevent quota bursts...`,
+            waitSec,
+            'verifier conductor queue',
+          )
+        }
+        if (this.verifierPumpTimer) clearTimeout(this.verifierPumpTimer)
+        this.verifierPumpTimer = setTimeout(() => {
+          this.verifierPumpTimer = null
+          this.pumpVerifierQueue()
+        }, waitMs + 200)
+      }
+    } finally {
+      this.isPumpingVerifierQueue = false
+    }
+  }
+
+  /**
    * Central coordinator orchestrator for Verifier & Rescan:
    * Checks from above across ALL parallel scans if capacity and stagger gap allow dispatch right now.
    */
   public canDispatchVerifyOrRescan(
     apiKey: string,
     modelId: string,
-    rpdCap: number = 500,
+    rpdCap?: number,
   ): { ok: boolean; reason?: string; waitMs?: number; cooling?: boolean } {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelDailyCap(modelId)
 
-    // 1. Quota check against Settings data: if used < rpdCap, quota is STILL AVAILABLE!
+    // 1. Quota check against Settings data: if used < cap, quota is STILL AVAILABLE!
     const used = getModelUsage(modelId, apiKey)
-    if (used >= rpdCap) {
-      return { ok: false, reason: `Daily quota limit reached in Settings (${used}/${rpdCap} RPD)`, waitMs: 60000 }
+    if (used >= cap) {
+      return { ok: false, reason: `Daily quota limit reached in Settings (${used}/${cap} RPD)`, waitMs: 60000 }
     }
 
     // 2. Specific lane busy/cooldown check
-    const laneStatus = this.isLaneBusy(apiKey, modelId, 0, rpdCap)
+    const laneStatus = this.isLaneBusy(apiKey, modelId, 0, cap)
     if (laneStatus.busy) {
       return {
         ok: false,
@@ -110,7 +300,7 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    // 4. Central global dispatch stagger gap (min 2.0s between any two outgoing dispatches)
+    // 4. Central global dispatch stagger gap (min 6.0s between any two outgoing dispatches)
     const now = Date.now()
     const gapNeeded = (this.lastGlobalVerifyDispatchAt + this.GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS) - now
     if (gapNeeded > 0) {
@@ -146,18 +336,19 @@ class GlobalGeminiCoordinator {
   /**
    * Instant, zero-wait quota check against Settings data:
    * Verifies if a model on a given API key has exhausted its daily quota (RPD).
-   * CRITICAL: If getModelUsage < rpdCap, quota is STILL AVAILABLE in Settings!
+   * CRITICAL: If getModelUsage < cap, quota is STILL AVAILABLE in Settings!
    * Never marks exhausted prematurely!
    */
-  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
+  public isModelExhausted(apiKey: string, modelId: string, rpdCap?: number): boolean {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelDailyCap(modelId)
     const used = getModelUsage(modelId, apiKey)
-    if (used < rpdCap) {
-      const lane = this.getOrCreateLane(apiKey, modelId, 0)
+    const lane = this.getOrCreateLane(apiKey, modelId, 0)
+    if (used < cap) {
       lane.isExhausted = false
+      clearModelExhausted(modelId, apiKey)
       return false
     }
-    const lane = this.getOrCreateLane(apiKey, modelId, 0)
     lane.isExhausted = true
     return true
   }
@@ -411,9 +602,10 @@ class GlobalGeminiCoordinator {
         // Lock is free! Acquire exclusively now.
         const isVerRes = this.isVerifyOrRescan(operation)
         if (isVerRes) {
-          // Check central global verifier/rescan concurrency cap across all scans
-          if (this.activeVerifyRescanCount >= this.MAX_GLOBAL_VERIFY_RESCAN) {
-            onWait?.(`[Global Coordinator] Global verifier/rescan capacity full (${this.activeVerifyRescanCount}/${this.MAX_GLOBAL_VERIFY_RESCAN} active across all scans). Queued...`, 2)
+          const kh = apiKeyHash(apiKey)
+          // Strictly NO concurrent verifier on same key, or exceeding global verifier capacity
+          if (this.activeVerifyRescanKeys.has(kh) || this.activeVerifyRescanCount >= this.MAX_GLOBAL_VERIFY_RESCAN) {
+            onWait?.(`[Global Coordinator] Global verifier capacity full (${this.activeVerifyRescanCount}/${this.MAX_GLOBAL_VERIFY_RESCAN} active). Queuing...`, 2)
             lane.waiters.push({
               scanId,
               scanTitle,
@@ -429,7 +621,7 @@ class GlobalGeminiCoordinator {
             return
           }
 
-          // Check central global dispatch stagger gap (min 2.0s between any two outgoing verifier/rescan dispatches across all scans)
+          // Check central global dispatch stagger gap (min 6.0s between any two outgoing verifier/rescan dispatches across all scans)
           const nowMs = Date.now()
           const gapNeeded = (this.lastGlobalVerifyDispatchAt + this.GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS) - nowMs
           if (gapNeeded > 0) {
@@ -438,6 +630,7 @@ class GlobalGeminiCoordinator {
           }
 
           this.activeVerifyRescanCount++
+          this.activeVerifyRescanKeys.add(kh)
           this.lastGlobalVerifyDispatchAt = Date.now()
         }
 
@@ -459,11 +652,8 @@ class GlobalGeminiCoordinator {
 
   /**
    * Dynamically search across multiple candidate lanes (different API keys and/or models).
-   * 1. If any candidate lane is immediately free (not in use, not cooling, not pacing, not exhausted),
-   *    grab that free lane instantly with ZERO wait!
-   * 2. If all candidate lanes are busy, poll/re-evaluate EVERY 1 SECOND across ALL candidates.
-   *    As soon as ANY lane (e.g. Key 3 · 3.8, or Key 2 · 3.6) frees up first,
-   *    immediately shift to that newly freed lane and acquire it!
+   * 1. If operation is Verifier or Rescan: delegates to Remote Central Overseer Queue (coordinates all scans from above).
+   * 2. If operation is Chunk scan: completely unchanged direct search loop with zero interference.
    */
   public async acquireFirstAvailableLane(opts: {
     scanId: string
@@ -491,7 +681,32 @@ class GlobalGeminiCoordinator {
       throw new Error('No candidate lanes provided for execution')
     }
 
-    const isVerRes = this.isVerifyOrRescan(operation)
+    // 1. VERIFIER & RESCAN: Remote Central Conductor Coordinates All Scans From Above!
+    // Prevents post-cooldown bursts and concurrent verifier collisions across parallel scans.
+    if (this.isVerifyOrRescan(operation)) {
+      return new Promise<{
+        selected: CandidateLane
+        release: (actualVideoSec?: number, cooldownOverrideMs?: number) => void
+      }>((resolve, reject) => {
+        const ticket: VerifierTicket = {
+          id: `vt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          scanId,
+          scanTitle,
+          operation,
+          candidates,
+          videoSeconds,
+          onWait,
+          isStopping,
+          resolve,
+          reject,
+          queuedAt: Date.now(),
+        }
+        this.verifierQueue.push(ticket)
+        this.pumpVerifierQueue()
+      })
+    }
+
+    // 2. CHUNKS SCAN (Unchanged): Direct dynamic search across candidate lanes
     let lastLoggedWaitMsg = ''
 
     while (true) {
@@ -503,29 +718,16 @@ class GlobalGeminiCoordinator {
 
       this.checkDayRollover()
 
-      // 1. Filter out permanently exhausted / disabled lanes using Settings data
+      // Filter out permanently exhausted / disabled lanes using Settings data
       const availableCandidates = candidates.filter((c) => {
-        return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 500)
+        return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd)
       })
 
       if (availableCandidates.length === 0) {
         throw new Error('All candidate keys/models have reached their daily quota or are exhausted')
       }
 
-      // If this is a verifier/rescan operation and global verifier capacity is full across all scans:
-      if (isVerRes && this.activeVerifyRescanCount >= this.MAX_GLOBAL_VERIFY_RESCAN) {
-        const fullMsg = `[Global Coordinator] Global verifier/rescan capacity full (${this.activeVerifyRescanCount}/${this.MAX_GLOBAL_VERIFY_RESCAN} active). Pacing parallel scans...`
-        if (fullMsg !== lastLoggedWaitMsg) {
-          lastLoggedWaitMsg = fullMsg
-          onWait?.(fullMsg, 2, 'all scans')
-        }
-        const jitterMs = 1200 + Math.floor(Math.random() * 600)
-        await new Promise((r) => setTimeout(r, jitterMs))
-        continue
-      }
-
-      // Sort candidates to prioritize same-key multi-model usage before switching keys:
-      // Group by keyIdx ascending, and test available models on the current key first
+      // Sort candidates to prioritize same-key multi-model usage before switching keys
       const sortedCandidates = [...availableCandidates].sort((a, b) => {
         if (a.keyIdx !== b.keyIdx) return a.keyIdx - b.keyIdx
         const aUsage = getModelUsage(a.modelId, a.apiKey)
@@ -533,7 +735,7 @@ class GlobalGeminiCoordinator {
         return aUsage - bUsage
       })
 
-      // 2. Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
+      // Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
       for (const cand of sortedCandidates) {
         const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
         const isFree =
@@ -543,18 +745,6 @@ class GlobalGeminiCoordinator {
           lane.waiters.length === 0
 
         if (isFree) {
-          if (isVerRes) {
-            // Enforce central global dispatch stagger gap (min 2.0s between outgoing verifier dispatches)
-            const nowMs = Date.now()
-            const gapNeeded = (this.lastGlobalVerifyDispatchAt + this.GLOBAL_VERIFY_DISPATCH_MIN_GAP_MS) - nowMs
-            if (gapNeeded > 0) {
-              onWait?.(`[Global Coordinator] Staggering verifier dispatch (~${Math.ceil(gapNeeded / 1000)}s gap)...`, 1, `Key ${cand.keyIdx}`)
-              await new Promise((r) => setTimeout(r, gapNeeded + Math.floor(Math.random() * 300)))
-            }
-            this.activeVerifyRescanCount++
-            this.lastGlobalVerifyDispatchAt = Date.now()
-          }
-
           // Immediately grab this free lane!
           lane.activeScanId = scanId
           lane.activeScanTitle = scanTitle
@@ -569,7 +759,7 @@ class GlobalGeminiCoordinator {
         }
       }
 
-      // 3. None are immediately free. Calculate estimated shortest wait time across all candidate lanes
+      // None are immediately free. Calculate estimated shortest wait time across all candidate lanes
       const waits = sortedCandidates.map((c) => {
         const lane = this.getOrCreateLane(c.apiKey, c.modelId, c.slot || 0, c.keyIdx)
         const cdWait = Math.max(0, lane.cooldownUntil - now)
@@ -595,7 +785,7 @@ class GlobalGeminiCoordinator {
         onWait?.(waitMsg, waitSec, candidateSummary)
       }
 
-      // 4. Sleep with jitter (1000ms - 1500ms) so parallel scans/workers do not wake at the exact same millisecond after cooldown!
+      // Sleep with jitter (1000ms - 1500ms) so parallel scans/workers do not wake at the exact same millisecond after cooldown
       const jitterMs = 1000 + Math.floor(Math.random() * 500)
       await new Promise((r) => setTimeout(r, jitterMs))
     }
@@ -605,7 +795,12 @@ class GlobalGeminiCoordinator {
     const op = lane.activeOperation || lane.lastOperation || ''
     if (this.isVerifyOrRescan(op)) {
       this.activeVerifyRescanCount = Math.max(0, this.activeVerifyRescanCount - 1)
+      this.activeVerifyRescanKeys.delete(lane.keyHash)
       this.lastGlobalVerifyDispatchAt = Date.now()
+
+      setTimeout(() => {
+        this.pumpVerifierQueue()
+      }, 1500)
     }
 
     const paceMs = cooldownOverrideMs !== undefined
@@ -710,80 +905,63 @@ class GlobalGeminiCoordinator {
   /**
    * Smart Quota/Rate Limit handler according to user rules:
    * 1. Check Settings where usage data is stored!
-   *    If actual used < rpdCap, quota is STILL AVAILABLE today! NEVER mark as exhausted!
+   *    If actual used < cap, quota is STILL AVAILABLE today! NEVER mark as exhausted!
    * 2. Apply a randomized cooldown (70s - 78s) on that model so parallel scans don't wake up all at once.
-   * 3. Only mark definitively exhausted if real tracked usage has actually reached the daily cap (used >= rpdCap).
+   * 3. Only mark definitively exhausted if real tracked usage has actually reached the daily cap (used >= cap).
    */
   public handleQuotaOrRateError(
     apiKey: string,
     modelId: string,
     slot: number = 0,
-    rpdCap: number = 20,
-    isExplicitDailyMsg: boolean = false,
+    rpdCap?: number,
+    ..._extraArgs: unknown[]
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
     reason: string
   } {
+    void _extraArgs
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    const cap = rpdCap ?? getModelDailyCap(modelId)
     const used = getModelUsage(modelId, apiKey)
 
-    // 1. Genuine daily exhaustion: only if actual recorded usage in Settings has reached or exceeded rpdCap!
-    if (used >= rpdCap) {
-      this.reportExhausted(apiKey, modelId, slot, rpdCap)
+    // 1. Genuine daily exhaustion: ONLY if actual recorded usage in Settings has reached or exceeded cap!
+    if (used >= cap) {
+      this.reportExhausted(apiKey, modelId, slot, cap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota limit reached in Settings (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
+        reason: `Daily quota limit reached in Settings (${used}/${cap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
       }
     }
 
     lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
 
     // 2. CRITICAL USER RULE:
-    // If usage in Settings is below rpdCap, quota is STILL REMAINING for today!
-    // NEVER mark as exhausted for the day after 2 requests/errors!
+    // If usage in Settings is below cap, quota is STILL REMAINING for today!
+    // NEVER mark as exhausted for the day after 1, 2, or any number of rate/quota errors!
     // Put ONLY this model in 70s-78s cooldown and allow retry when cooled down!
-    if (used < rpdCap && !isExplicitDailyMsg) {
-      lane.isExhausted = false
-      const jitterCooldownMs = CHUNK_COOLDOWN_MS + Math.floor(Math.random() * 8000)
-      this.reportRateLimit(apiKey, modelId, jitterCooldownMs, slot)
-      return {
-        action: 'cooldown',
-        waitSec: Math.ceil(jitterCooldownMs / 1000),
-        reason: `Temporary rate limit (429) on ${modelId} (Key ${lane.keyIdx}). Quota remaining in Settings (${used}/${rpdCap} RPD) — cooling down for ${Math.ceil(jitterCooldownMs / 1000)}s before retry`,
-      }
-    }
-
-    // 3. Explicit daily quota message from Google AND usage is near cap (>= rpdCap - 1)
-    if (isExplicitDailyMsg && used >= Math.max(1, rpdCap - 1)) {
-      this.reportExhausted(apiKey, modelId, slot, rpdCap)
-      return {
-        action: 'exhausted',
-        waitSec: 0,
-        reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) (${used}/${rpdCap} RPD)`,
-      }
-    }
-
-    // 4. Fallback: quota is still remaining in Settings! Do not exhaust!
     lane.isExhausted = false
-    const fallbackCooldownMs = CHUNK_COOLDOWN_MS + Math.floor(Math.random() * 8000)
-    this.reportRateLimit(apiKey, modelId, fallbackCooldownMs, slot)
+    clearModelExhausted(modelId, apiKey)
+    const jitterCooldownMs = CHUNK_COOLDOWN_MS + Math.floor(Math.random() * 8000)
+    this.reportRateLimit(apiKey, modelId, jitterCooldownMs, slot)
     return {
       action: 'cooldown',
-      waitSec: Math.ceil(fallbackCooldownMs / 1000),
-      reason: `Rate limit on ${modelId} (Key ${lane.keyIdx}). Quota remaining in Settings (${used}/${rpdCap} RPD) — cooling down for ${Math.ceil(fallbackCooldownMs / 1000)}s before retry`,
+      waitSec: Math.ceil(jitterCooldownMs / 1000),
+      reason: `Rate limit (429) on ${modelId} (Key ${lane.keyIdx}). Quota remaining in Settings (${used}/${cap} RPD) — cooling down for ${Math.ceil(jitterCooldownMs / 1000)}s before retry`,
     }
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
-  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20) {
+  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap?: number) {
+    const cap = rpdCap ?? getModelDailyCap(modelId)
     const used = getModelUsage(modelId, apiKey)
-    if (used < rpdCap) {
+    if (used < cap) {
       // Quota is still available in Settings! Refuse to mark exhausted!
       const lane = this.getOrCreateLane(apiKey, modelId, slot)
       lane.isExhausted = false
+      clearModelExhausted(modelId, apiKey)
       return
     }
 
@@ -799,7 +977,7 @@ class GlobalGeminiCoordinator {
         while (other.waiters.length > 0) {
           const waiter = other.waiters.shift()
           if (waiter) {
-            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted`))
+            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily quota (${cap} RPD) exhausted`))
           }
         }
       }
@@ -807,7 +985,7 @@ class GlobalGeminiCoordinator {
 
     // Persist to counters.json so subsequent workers/processes know this model is quota-capped today
     try {
-      setModelExhausted(modelId, apiKey, rpdCap)
+      setModelExhausted(modelId, apiKey, cap)
     } catch {}
   }
 

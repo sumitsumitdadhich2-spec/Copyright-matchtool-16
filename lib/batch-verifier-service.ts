@@ -8,7 +8,7 @@ import { planMinuteSegments, stitchMinuteVerificationClips } from './batch-minut
 import { buildBatchVerifierPrompt, fmtMs } from './batch-verifier-prompt'
 import { CancelToken } from './ffmpeg-pool'
 import { sameShortSegment } from './candidate-pick'
-import { CHUNK_COOLDOWN_MS } from './models'
+import { CHUNK_COOLDOWN_MS, getModelDailyCap } from './models'
 import type { Scan, BatchMinuteResult, BatchVerifyPart, BatchVerifyState, ChunkMatch } from './types'
 
 const BATCH_VERIFY_MODELS = ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash']
@@ -142,12 +142,13 @@ async function getBatchCandidateLanes(scan: Scan): Promise<CandidateLane[]> {
   const lanes: CandidateLane[] = []
   allKeys.forEach((apiKey, keyIdx) => {
     for (const modelId of BATCH_VERIFY_MODELS) {
-      if (!globalGeminiCoordinator.isModelExhausted(apiKey, modelId, 20)) {
+      const cap = getModelDailyCap(modelId)
+      if (!globalGeminiCoordinator.isModelExhausted(apiKey, modelId, cap)) {
         lanes.push({
           apiKey,
           keyIdx: keyIdx + 1,
           modelId,
-          rpd: 20,
+          rpd: cap,
         })
       }
     }
@@ -312,7 +313,7 @@ export async function verifySingleMinute(
             chosenLane.apiKey,
             chosenLane.modelId,
             0,
-            chosenLane.rpd || 20,
+            chosenLane.rpd || getModelDailyCap(chosenLane.modelId),
             geminiErr.kind === 'rpd',
           )
           logScan(
@@ -678,8 +679,9 @@ export async function startBatchVerificationAll(scanId: string): Promise<void> {
   void (async () => {
     try {
       const pendingMinutes = Array.from({ length: minuteCount }, (_, minIdx) => minIdx)
-      // Process minutes with bounded concurrency (max 2 per scan to leave headroom for other parallel scans)
-      const CONCURRENCY = Math.min(2, minuteCount)
+      // Process minutes sequentially per scan (CONCURRENCY = 1) so parallel scans do not compete internally,
+      // and allow the Global Verifier Overseer to coordinate and stagger dispatches across all scans safely.
+      const CONCURRENCY = 1
       const workers = Array.from({ length: CONCURRENCY }, async () => {
         while (pendingMinutes.length > 0) {
           if (token.isCancelled()) break

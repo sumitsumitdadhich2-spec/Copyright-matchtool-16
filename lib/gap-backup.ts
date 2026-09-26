@@ -456,10 +456,17 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               queue.push(item)
               log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — disabled for this scan; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
             } else if (e.kind === 'rpd') {
-              setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
-              lane.dead = true
-              queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily token/request quota exhausted — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+              const used = getModelUsage(lane.model.id, lane.key)
+              if (used >= lane.model.rpd) {
+                setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
+                lane.dead = true
+                queue.push(item)
+                log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted in Settings (${used}/${lane.model.rpd} RPD) — model lane removed; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+              } else {
+                lane.cooldownUntil = Date.now() + 60_000 + Math.floor(Math.random() * 8000)
+                queue.push(item)
+                log(scan, 'warn', `Missing-scene finder: Rate limit on ${lane.model.id} (key ${lane.keyIndex + 1}). Quota remaining in Settings (${used}/${lane.model.rpd} RPD) — cooling down for 60s, chunk ${chunkIndex + 1} re-queued`)
+              }
             } else if (e.kind === 'empty') {
               lane.cooldownUntil = Date.now() + 3_000
               queue.push(item)

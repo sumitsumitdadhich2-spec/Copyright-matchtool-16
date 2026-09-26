@@ -1171,12 +1171,23 @@ async function laneWorker(
         queue.push(idx)
         log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} disabled for this scan; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rpd') {
-        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
-        setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
-        lane.dead = true
-        w.status = 'pending'
-        queue.push(idx)
-        log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
+        const used = getModelUsage(lane.model.id, lane.apiKey)
+        if (used >= lane.model.rpd) {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
+          setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
+          lane.dead = true
+          w.status = 'pending'
+          queue.push(idx)
+          log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted in Settings (${used}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
+        } else {
+          isRateLimit = true
+          const coolMs = CHUNK_COOLDOWN_MS + Math.floor(Math.random() * 8000)
+          globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
+          ctrl.cooldownUntil[rk] = Date.now() + coolMs
+          w.status = 'pending'
+          queue.push(idx)
+          log(id, 'warn', `${tag} #${w.index}: Rate limit (429) on ${lane.label}. Quota remaining in Settings (${used}/${lane.model.rpd} RPD) — 1m 10s cooldown before retry, re-queued`)
+        }
       } else if (e.kind === 'rate') {
         isRateLimit = true
         const coolMs = CHUNK_COOLDOWN_MS
