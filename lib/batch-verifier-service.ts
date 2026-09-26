@@ -8,10 +8,15 @@ import { planMinuteSegments, stitchMinuteVerificationClips } from './batch-minut
 import { buildBatchVerifierPrompt, fmtMs } from './batch-verifier-prompt'
 import { CancelToken } from './ffmpeg-pool'
 import { sameShortSegment } from './candidate-pick'
-import { CHUNK_COOLDOWN_MS, getModelDailyCap } from './models'
+import { CHUNK_COOLDOWN_MS, getModelDailyCap, RESCAN_MODEL_POOL, RESCAN_BACKUP_POOL } from './models'
 import type { Scan, BatchMinuteResult, BatchVerifyPart, BatchVerifyState, ChunkMatch } from './types'
 
-const BATCH_VERIFY_MODELS = ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash']
+/** Verifier & Rescan models: Priority 1 gemini-3.5-flash, Priority 2 gemini-3-flash-preview.
+ * Fallback to high-limit lite models (gemini-3.5-flash-lite, gemini-3.1-flash-lite) when primary daily quota is reached. */
+const BATCH_VERIFY_MODELS = [
+  ...RESCAN_MODEL_POOL.map((m) => m.id),
+  ...RESCAN_BACKUP_POOL.map((m) => m.id),
+]
 
 // In-memory registry of cancel tokens per scan
 const activeCancelTokens = new Map<string, CancelToken>()

@@ -1567,6 +1567,10 @@ class Scheduler {
         }
         return
       }
+      if (st.state === 'exhausted') {
+        st.state = 'idle'
+        this.mark(job)
+      }
 
       // Cooldown check (RPM/TPM-type 429)
       const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
@@ -2304,6 +2308,10 @@ class Scheduler {
           this.mark(job)
         }
         return
+      }
+      if (st.state === 'exhausted') {
+        st.state = 'idle'
+        this.mark(job)
       }
 
       // Cooldown check (RPM/TPM-type 429).

@@ -5,7 +5,6 @@ import {
   getModelUsage,
   setModelExhausted,
   clearModelExhausted,
-  isModelDailyQuotaExhausted,
   geminiUsageDay,
   checkDailyReset,
 } from './store'
@@ -159,13 +158,29 @@ class GlobalGeminiCoordinator {
           continue
         }
 
-        // Sort: prioritize key with least usage, and model with least usage
-        availableCands.sort((a, b) => {
+        // USER RULE: Primary models in Rescan & Verifier are Priority 1: gemini-3.5-flash, Priority 2: gemini-3-flash-preview.
+        // Fallback to lite models (gemini-3.5-flash-lite, gemini-3.1-flash-lite) ONLY when primary daily quota is exhausted!
+        const hasAlivePrimary = availableCands.some(
+          (c) => c.modelId === 'gemini-3.5-flash' || c.modelId === 'gemini-3-flash-preview',
+        )
+
+        const candsToConsider = hasAlivePrimary
+          ? availableCands.filter((c) => c.modelId === 'gemini-3.5-flash' || c.modelId === 'gemini-3-flash-preview')
+          : availableCands
+
+        // Sort candidates:
+        // 1. Model priority: gemini-3.5-flash (score 1) > gemini-3-flash-preview (score 2) > other > lite (score 10)
+        // 2. Key index: Key 1 > Key 2 > Key 3...
+        // 3. Lowest recorded usage first
+        candsToConsider.sort((a, b) => {
+          const scoreA = a.modelId === 'gemini-3.5-flash' ? 1 : a.modelId === 'gemini-3-flash-preview' ? 2 : a.modelId.includes('lite') ? 10 : 5
+          const scoreB = b.modelId === 'gemini-3.5-flash' ? 1 : b.modelId === 'gemini-3-flash-preview' ? 2 : b.modelId.includes('lite') ? 10 : 5
+          if (scoreA !== scoreB) return scoreA - scoreB
           if (a.keyIdx !== b.keyIdx) return a.keyIdx - b.keyIdx
           return getModelUsage(a.modelId, a.apiKey) - getModelUsage(b.modelId, b.apiKey)
         })
 
-        for (const cand of availableCands) {
+        for (const cand of candsToConsider) {
           const kh = apiKeyHash(cand.apiKey)
           // Strictly NO concurrent verifier on the same API key!
           if (this.activeVerifyRescanKeys.has(kh)) continue
@@ -233,7 +248,17 @@ class GlobalGeminiCoordinator {
       // No lane currently free: find shortest cooldown among queued tickets to schedule next wake-up
       let shortestWait = Infinity
       for (const ticket of this.verifierQueue) {
-        for (const cand of ticket.candidates) {
+        const availableCands = ticket.candidates.filter(
+          (c) => !this.isModelExhausted(c.apiKey, c.modelId, c.rpd),
+        )
+        const hasAlivePrimary = availableCands.some(
+          (c) => c.modelId === 'gemini-3.5-flash' || c.modelId === 'gemini-3-flash-preview',
+        )
+        const cands = hasAlivePrimary
+          ? availableCands.filter((c) => c.modelId === 'gemini-3.5-flash' || c.modelId === 'gemini-3-flash-preview')
+          : availableCands
+
+        for (const cand of cands) {
           const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
           if (lane.cooldownUntil > now && lane.cooldownUntil < shortestWait) {
             shortestWait = lane.cooldownUntil
@@ -389,7 +414,7 @@ class GlobalGeminiCoordinator {
   }
 
   /** Check if a lane is currently in use by ANY scan, in cooldown/pacing, or exhausted */
-  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 500): {
+  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap?: number): {
     busy: boolean
     exhausted?: boolean
     activeScanId?: string
@@ -399,15 +424,20 @@ class GlobalGeminiCoordinator {
     cooling?: boolean
   } {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelDailyCap(modelId)
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
 
-    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+    const used = getModelUsage(modelId, apiKey)
+    if (used < cap) {
+      lane.isExhausted = false
+      clearModelExhausted(modelId, apiKey)
+    } else {
       lane.isExhausted = true
       return {
         busy: true,
         exhausted: true,
-        activeOperation: 'Exhausted for today',
+        activeOperation: `Exhausted in Settings (${used}/${cap} RPD)`,
       }
     }
 
@@ -492,18 +522,40 @@ class GlobalGeminiCoordinator {
       slot = 0,
       operation,
       videoSeconds = 60,
-      rpd = 500,
+      rpd,
       onWait,
       isStopping,
     } = opts
+
+    const effectiveRpd = rpd ?? getModelDailyCap(modelId)
+
+    // Unify all Verifier & Rescan requests across ALL parallel scans under the Remote Central Conductor
+    if (this.isVerifyOrRescan(operation)) {
+      const res = await this.acquireFirstAvailableLane({
+        scanId,
+        scanTitle,
+        candidates: [{
+          apiKey,
+          keyIdx,
+          modelId,
+          slot,
+          rpd: effectiveRpd,
+        }],
+        operation,
+        videoSeconds,
+        onWait: (msg, waitSec) => onWait?.(msg, waitSec),
+        isStopping,
+      })
+      return res.release
+    }
 
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
 
     // Pre-flight quota check: if daily quota is already exhausted, abort immediately without waiting or uploading!
-    if (this.isModelExhausted(apiKey, modelId, rpd)) {
+    if (this.isModelExhausted(apiKey, modelId, effectiveRpd)) {
       lane.isExhausted = true
-      throw new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`)
+      throw new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${effectiveRpd} RPD) is exhausted for today. Skipping immediately.`)
     }
 
     return new Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void>((resolve, reject) => {

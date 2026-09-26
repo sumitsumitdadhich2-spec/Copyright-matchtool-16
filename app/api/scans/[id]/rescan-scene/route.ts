@@ -8,7 +8,7 @@ import { getAllUserApiKeys } from '@/lib/user-keys'
 import { extractClipPrecise } from '@/lib/ffmpeg'
 import { uploadVideo, deleteFileQuiet, rescanRequest, parseRescanMatch, classifyError } from '@/lib/gemini'
 import { globalGeminiCoordinator, type CandidateLane } from '@/lib/global-gemini-coordinator'
-import { CHUNK_COOLDOWN_MS, getModelDailyCap } from '@/lib/models'
+import { CHUNK_COOLDOWN_MS, getModelDailyCap, RESCAN_MODEL_POOL, RESCAN_BACKUP_POOL } from '@/lib/models'
 import { sameShortSegment, applyGroupMatches } from '@/lib/candidate-pick'
 import { invalidateRenderedOutput } from '@/lib/render'
 import { fmtTime } from '@/lib/format'
@@ -94,18 +94,50 @@ export async function POST(
     }
 
     const requestedModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null
-    const allowedModels = requestedModel
-      ? [requestedModel]
-      : ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash']
 
-    const candidates = allKeys.flatMap((k, ki) =>
-      allowedModels.map((mId) => ({
-        apiKey: k,
-        keyIdx: ki + 1,
-        modelId: mId,
-        rpd: getModelDailyCap(mId),
-      })),
-    )
+    // Rescan model priority: Priority 1 gemini-3.5-flash, Priority 2 gemini-3-flash-preview.
+    // When both are exhausted in Settings (used >= rpd), fallback to lite models (gemini-3.5-flash-lite, gemini-3.1-flash-lite).
+    const primaryRescanModels = RESCAN_MODEL_POOL.map((m) => m.id)
+    const backupRescanModels = RESCAN_BACKUP_POOL.map((m) => m.id)
+
+    // Build candidates: Primary models first across keys, then backup lite models
+    const primaryCandidates: CandidateLane[] = []
+    const backupCandidates: CandidateLane[] = []
+
+    for (let ki = 0; ki < allKeys.length; ki++) {
+      const k = allKeys[ki]
+      const keyIdx = ki + 1
+
+      if (requestedModel) {
+        primaryCandidates.push({
+          apiKey: k,
+          keyIdx,
+          modelId: requestedModel,
+          rpd: getModelDailyCap(requestedModel),
+        })
+        continue
+      }
+
+      for (const mId of primaryRescanModels) {
+        primaryCandidates.push({
+          apiKey: k,
+          keyIdx,
+          modelId: mId,
+          rpd: getModelDailyCap(mId),
+        })
+      }
+
+      for (const mId of backupRescanModels) {
+        backupCandidates.push({
+          apiKey: k,
+          keyIdx,
+          modelId: mId,
+          rpd: getModelDailyCap(mId),
+        })
+      }
+    }
+
+    const candidates = [...primaryCandidates, ...backupCandidates]
 
     opSecs = Math.ceil(shortDur + padBefore + padAfter + (chunkEnd - chunkStart))
 

@@ -28,15 +28,16 @@ export const VERIFY_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
 ]
 
-/** RESCAN models (primary): gemini-3-flash-preview and gemini-3.5-flash run
- * rescan requests (full-chunk segment hunt). Thinking level HIGH and max
- * output tokens apply globally to every request (see GEN_CONFIG). */
+/** RESCAN models (primary): gemini-3.5-flash and gemini-3-flash-preview run
+ * rescan requests (full-chunk segment hunt). Priority 1 is gemini-3.5-flash (500 RPD, 5 RPM),
+ * Priority 2 is gemini-3-flash-preview (20 RPD, 5 RPM).
+ * Thinking level HIGH and max output tokens apply globally (see GEN_CONFIG). */
 export const RESCAN_MODEL_POOL: ModelSpec[] = [
-  { id: 'gemini-3-flash-preview', rpm: 5, rpd: 20 },
   { id: 'gemini-3.5-flash', rpm: 5, rpd: 500 },
+  { id: 'gemini-3-flash-preview', rpm: 5, rpd: 20 },
 ]
 
-/** RESCAN BACKUP models: jab primary rescan models (3-flash-preview / 3.5-flash)
+/** RESCAN BACKUP models: jab primary rescan models (3.5-flash / 3-flash-preview)
  * ki daily limit khatam ho jaye, to rescan in HIGH-LIMIT lite models par
  * fallback karta hai (500 RPD each) — rescan kabhi ruke nahi. */
 export const RESCAN_BACKUP_POOL: ModelSpec[] = [
