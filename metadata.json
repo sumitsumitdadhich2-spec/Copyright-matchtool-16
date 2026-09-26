@@ -1,0 +1,6 @@
+{
+  "name": "Shiva MatchTool",
+  "description": "Find where a short video clip appears inside a full movie using an AI scanner.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

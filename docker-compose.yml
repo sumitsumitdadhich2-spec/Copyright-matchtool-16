@@ -1,0 +1,79 @@
+# CMT on a single EC2 box (16 vCPU / 16 GB / 100 GB EBS, Ubuntu 24.04).
+#
+#   docker compose up -d --build
+#
+# Services:
+#   app    Next.js 16 long-lived Node server + ffmpeg (one engine per core)
+#   caddy  automatic HTTPS reverse proxy (Let's Encrypt), unlimited body size
+#
+# Persistent data:
+#   /data       -> EBS bind mount (originals, scan JSON, render/merge outputs)
+#   /dev/shm    -> tmpfs (RAM) hot work area for ffmpeg, capped by shm_size
+#   caddy_data  -> TLS certificates
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cmt-app:latest
+    restart: always
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      DATA_DIR: /data
+      WORK_DIR: /dev/shm/cmt
+    volumes:
+      # 100 GB EBS volume mounted on the host at /data (see docs/AWS-DEPLOY.md)
+      - /data:/data
+    # RAM work area for ffmpeg intermediates. WORK_RAM_BUDGET_MB (default 6144)
+    # must stay below this so the tmpfs can never fill up.
+    shm_size: 8gb
+    # Node + up to 16 single-threaded ffmpeg processes.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    expose:
+      - "3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: always
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # Public hostname (DNS A record -> EC2 elastic IP). Leave empty to serve
+      # plain HTTP on :80 (useful before DNS is ready).
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+data
+docs
+*.mp4
+*.mkv
+*.mov
+*.webm
+.v0-trash
+.vercel
+__v0_*

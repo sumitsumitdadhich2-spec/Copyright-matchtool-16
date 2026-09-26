@@ -1,0 +1,47 @@
+# Reverse proxy for the CMT app.
+# SITE_ADDRESS=cmt.example.com  -> automatic HTTPS (Let's Encrypt)
+# SITE_ADDRESS=:80              -> plain HTTP (before DNS is set up)
+
+{
+	servers {
+		# HTTP/1.1 ONLY — this is an upload-speed fix, not a downgrade.
+		#
+		# Caddy's HTTP/2 (Go net/http2) gives every upload stream a FIXED 1 MB
+		# flow-control window, so a browser can never have more than 1 MB in
+		# flight: throughput = 1 MB / round-trip. With 200 ms to the EC2 region
+		# that caps a single upload at ~5 MB/s (~40 Mbps) no matter how fast the
+		# line is. HTTP/3 (QUIC) has a similar per-stream window. Plain HTTP/1.1
+		# has no such window — TCP alone decides, so the single stream saturates
+		# the user's real upload bandwidth. The dashboard is tiny, so losing
+		# multiplexing costs nothing.
+		protocols h1
+
+		# Long uploads / renders: never cut a request short.
+		timeouts {
+			read_body 0
+			read_header 60s
+			write 0
+			idle 30m
+		}
+	}
+}
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# NOTE: no `request_body max_size` here on purpose — Caddy has NO body size
+	# limit by default, and a video upload is ONE multi-GB request body that is
+	# streamed through to the app as it arrives (never buffered in Caddy).
+
+	reverse_proxy app:3000 {
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			# The upload route answers only after the LAST byte + ffprobe, which
+			# on a slow link can take well over 30 minutes — never time it out.
+			response_header_timeout 0
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}

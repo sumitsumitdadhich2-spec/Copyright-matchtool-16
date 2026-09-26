@@ -1,0 +1,31 @@
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+
+# Environment variables
+.env*.local
+
+# Common ignores
+node_modules
+.next/
+.DS_Store
+uploads/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Runtime data written by the app in local dev (DATA_DIR defaults to ./data).
+# Scan records, uploaded videos and in-progress .part/.meta upload files must
+# never be committed — in production this lives on the EBS volume (/data).
+data/media/
+data/scans/
+data/work/
+data/auth/
+data/counters.json
+data/settings.json
