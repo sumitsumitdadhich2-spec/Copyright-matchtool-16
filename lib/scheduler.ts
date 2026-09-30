@@ -16,6 +16,7 @@ import {
   pacingIntervalMs,
   type ModelSpec,
   getModelDailyCap,
+  displayModelName,
 } from './models'
 import {
   getScan,
@@ -28,6 +29,7 @@ import {
   geminiUsageDay,
   scanMediaDir,
   listScans,
+  bootQuotaCheck,
 } from './store'
 import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, sanitizeVideoMute, segmentPath } from './ffmpeg'
 import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
@@ -291,6 +293,7 @@ class Scheduler {
     scan.currentShortSegment = firstIncomplete.index
     scan.chunks = firstIncomplete.chunks
 
+    bootQuotaCheck()
     const isNewDay = checkDailyReset()
     if (isNewDay) {
       addLog(
@@ -336,19 +339,27 @@ class Scheduler {
         laneState = {
           idx: lane.idx,
           status: 'idle',
-          models: MODEL_POOL.map((m) => ({ id: m.id, state: 'idle' })),
+          models: MODEL_POOL.map((m) => {
+            const spec = MODEL_POOL.find((item) => item.id === m.id)
+            const cap = spec ? spec.rpd : getModelDailyCap(m.id)
+            const usage = getModelUsage(m.id, lane.apiKey)
+            return {
+              id: m.id,
+              state: usage >= cap ? 'exhausted' : 'idle',
+            }
+          }),
         }
         scan.keyLanes.push(laneState)
       } else if (laneState.status !== 'error') {
         for (const m of laneState.models) {
           const spec = MODEL_POOL.find((item) => item.id === m.id)
+          const cap = spec ? spec.rpd : getModelDailyCap(m.id)
           const usage = getModelUsage(m.id, lane.apiKey)
-          if (spec) {
-            if (usage < spec.rpd) {
-              if (m.state === 'exhausted') m.state = 'idle'
-            } else {
-              m.state = 'exhausted'
-            }
+          if (usage < cap) {
+            // Strictly reset to idle if Settings quota shows remaining quota!
+            if (m.state === 'exhausted') m.state = 'idle'
+          } else {
+            m.state = 'exhausted'
           }
         }
       }
@@ -1647,14 +1658,14 @@ class Scheduler {
           job.verifyQueue.push(gi)
           addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — disabled for this scan; group ${g.id} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
-          // EXACT SAME SYSTEM AS CHUNKS:
+          // Final decision strictly from Settings quota:
           const modelCap = m.rpd || getModelDailyCap(m.id)
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             0,
             modelCap,
-            e.kind === 'rpd',
+            lane.idx,
           )
           if (quotaOutcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey, modelCap)
@@ -1663,7 +1674,7 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'exhausted'
             }
-            addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; group ${g.id} re-queued for another worker.`)
+            addLog(scan, 'warn', `Verifier: ${displayModelName(m.id)} (key ${lane.idx}): ${quotaOutcome.reason}. Model reached Settings daily quota (${modelCap} RPD); group ${g.id} re-queued for another worker.`)
           } else {
             job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
             const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
@@ -1671,7 +1682,7 @@ class Scheduler {
               const ms = laneState.models?.find((item) => item.id === m.id)
               if (ms) ms.state = 'cooling'
             }
-            addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Group ${g.id} re-queued; model cooling for 1m 10s.`)
+            addLog(scan, 'warn', `Verifier: ${displayModelName(m.id)} (key ${lane.idx}): ${quotaOutcome.reason}. Group ${g.id} re-queued; model cooling for 1m 10s.`)
           }
           job.verifyQueue.push(gi)
         } else {
@@ -1803,6 +1814,17 @@ class Scheduler {
         const rawRes = await fn()
         st.usedToday = incrementModelUsage(m.id, lane.apiKey)
         globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, 0)
+        const cap = m.rpd || getModelDailyCap(m.id)
+        if (st.usedToday >= cap) {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, cap)
+          setModelExhausted(m.id, lane.apiKey, cap)
+          st.state = 'exhausted'
+          addLog(
+            scan,
+            'info',
+            `Verifier: ${displayModelName(m.id)} (key ${lane.idx}) reached Settings daily quota limit (${st.usedToday}/${cap} RPD) after successful execution — set aside for today.`,
+          )
+        }
         this.mark(job)
         return rawRes
       } catch (err) {
@@ -1815,7 +1837,7 @@ class Scheduler {
             m.id,
             0,
             modelCap,
-            e.kind === 'rpd',
+            lane.idx,
           )
           if (outcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey, modelCap)
@@ -2469,6 +2491,17 @@ class Scheduler {
           const used = incrementModelUsage(m.id, lane.apiKey)
           st.usedToday = used
           globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, 0)
+          const cap = m.rpd || getModelDailyCap(m.id)
+          if (used >= cap) {
+            globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, cap)
+            setModelExhausted(m.id, lane.apiKey, cap)
+            st.state = 'exhausted'
+            addLog(
+              scan,
+              'info',
+              `${displayModelName(m.id)} (key ${lane.idx}): Reached Settings daily quota limit (${used}/${cap} RPD) after successful execution — model set aside for today; remaining models continue.`,
+            )
+          }
           chunk.requestCount = (chunk.requestCount || 0) + 1
           this.mark(job)
         } catch (reqErr) {
@@ -2527,6 +2560,18 @@ class Scheduler {
               job.nextFreeAt[rk] = Date.now() + CHUNK_COOLDOWN_MS
               const usedRetry = incrementModelUsage(m.id, lane.apiKey)
               st.usedToday = usedRetry
+              globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, 0)
+              const capRetry = m.rpd || getModelDailyCap(m.id)
+              if (usedRetry >= capRetry) {
+                globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, capRetry)
+                setModelExhausted(m.id, lane.apiKey, capRetry)
+                st.state = 'exhausted'
+                addLog(
+                  scan,
+                  'info',
+                  `${displayModelName(m.id)} (key ${lane.idx}): Reached Settings daily quota limit (${usedRetry}/${capRetry} RPD) after successful execution — model set aside for today; remaining models continue.`,
+                )
+              }
               chunk.requestCount = (chunk.requestCount || 0) + 1
               addLog(scan, 'success', `${minutePrefix}Chunk ${chunkIndex}: Sanitized retry succeeded on ${m.id} (key ${lane.idx}) after policy flag bypass`)
               this.mark(job)
@@ -2552,6 +2597,18 @@ class Scheduler {
               job.nextFreeAt[rk] = Date.now() + CHUNK_COOLDOWN_MS
               const usedRetry = incrementModelUsage(m.id, lane.apiKey)
               st.usedToday = usedRetry
+              globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, 0)
+              const capRetry = m.rpd || getModelDailyCap(m.id)
+              if (usedRetry >= capRetry) {
+                globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, capRetry)
+                setModelExhausted(m.id, lane.apiKey, capRetry)
+                st.state = 'exhausted'
+                addLog(
+                  scan,
+                  'info',
+                  `${displayModelName(m.id)} (key ${lane.idx}): Reached Settings daily quota limit (${usedRetry}/${capRetry} RPD) after successful execution — model set aside for today; remaining models continue.`,
+                )
+              }
               chunk.requestCount = (chunk.requestCount || 0) + 1
               this.mark(job)
             } catch (retry503Err) {
@@ -2670,7 +2727,7 @@ class Scheduler {
             m.id,
             0,
             modelCap,
-            e.kind === 'rpd',
+            lane.idx,
           )
           if (quotaOutcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey, modelCap)
@@ -2679,7 +2736,7 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'exhausted'
             }
-            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
+            addLog(scan, 'warn', `${displayModelName(m.id)} (key ${lane.idx}): ${quotaOutcome.reason}. Model reached Settings daily quota (${modelCap} RPD); remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
           } else {
             job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
             const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
@@ -2687,7 +2744,7 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'cooling'
             }
-            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
+            addLog(scan, 'warn', `${displayModelName(m.id)} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

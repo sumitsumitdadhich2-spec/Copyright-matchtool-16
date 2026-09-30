@@ -3,10 +3,10 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
-import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
+import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay, bootQuotaCheck } from './store'
 import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
 import { preparePrescanMovieCopy, buildBackupClip, sanitizeVideoMute, PRESCAN_MAX_BYTES } from './ffmpeg'
-import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, CHUNK_COOLDOWN_MS, type ModelSpec } from './models'
+import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, CHUNK_COOLDOWN_MS, type ModelSpec, displayModelName } from './models'
 import {
   getClient,
   uploadVideo,
@@ -207,6 +207,7 @@ export function startGeminiMinuteFinder(
     return { ok: false, error: 'Gemini API key nahi hai — Settings me apni key add karo.' }
   }
 
+  bootQuotaCheck()
   const isNewDay = checkDailyReset()
   if (isNewDay) {
     addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
@@ -1170,7 +1171,7 @@ async function laneWorker(
         w.status = 'pending'
         queue.push(idx)
         log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} disabled for this scan; ${tag.toLowerCase()} #${w.index} re-queued`)
-      } else if (e.kind === 'rpd') {
+      } else if (e.kind === 'rpd' || e.kind === 'rate') {
         const used = getModelUsage(lane.model.id, lane.apiKey)
         if (used >= lane.model.rpd) {
           globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
@@ -1178,7 +1179,7 @@ async function laneWorker(
           lane.dead = true
           w.status = 'pending'
           queue.push(idx)
-          log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted in Settings (${used}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
+          log(id, 'warn', `Key ${lane.keyIdx} · ${displayModelName(lane.model.id)}: daily quota reached in Settings (${used}/${lane.model.rpd} RPD) — model lane retired, remaining models continue; ${tag.toLowerCase()} #${w.index} re-queued`)
         } else {
           isRateLimit = true
           const coolMs = CHUNK_COOLDOWN_MS + Math.floor(Math.random() * 8000)
@@ -1188,14 +1189,6 @@ async function laneWorker(
           queue.push(idx)
           log(id, 'warn', `${tag} #${w.index}: Rate limit (429) on ${lane.label}. Quota remaining in Settings (${used}/${lane.model.rpd} RPD) — 1m 10s cooldown before retry, re-queued`)
         }
-      } else if (e.kind === 'rate') {
-        isRateLimit = true
-        const coolMs = CHUNK_COOLDOWN_MS
-        globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
-        ctrl.cooldownUntil[rk] = Date.now() + coolMs
-        w.status = 'pending'
-        queue.push(idx)
-        log(id, 'warn', `${tag} #${w.index}: 429/rate on ${lane.label} — 1m 10s cooldown (other models on Key ${lane.keyIdx} remain active), re-queued: ${e.message.slice(0, 120)}`)
       } else if (isFileGoneError(e.message)) {
         w.status = 'pending'
         queue.push(idx)

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { listScans, newScan, saveScan, pruneOldScans, deleteScan, MAX_SCANS, SCANS_DIR } from '@/lib/store'
+import { listScans, newScan, saveScan, pruneOldScans, deleteScan, MAX_SCANS, SCANS_DIR, bootQuotaCheck } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
 import { getStorageUsage, invalidateUsageCache, STORAGE_LIMIT_BYTES } from '@/lib/media'
 import { getSession } from '@/lib/users'
@@ -14,6 +14,7 @@ export const runtime = 'nodejs'
 export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  bootQuotaCheck()
   await restoreScans(SCANS_DIR)
   await ensureBackgroundWorkers()
   const used = await getStorageUsage()
@@ -24,6 +25,7 @@ export async function GET() {
 export async function POST() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  bootQuotaCheck()
   await restoreScans(SCANS_DIR)
   const scan = newScan(session.username)
   if (session.username) {

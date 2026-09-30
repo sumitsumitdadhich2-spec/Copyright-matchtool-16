@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getAllUsage, getAllExhausted, MAX_API_KEYS, reconcileTodayCounters } from '@/lib/store'
+import { getAllUsage, getAllExhausted, MAX_API_KEYS, bootQuotaCheck } from '@/lib/store'
 import {
   getUserKeyN,
   setUserKeyN,
@@ -33,7 +33,7 @@ export async function GET() {
 
   // Reconcile and cleanse today's counters and spurious exhaustion flags
   try {
-    reconcileTodayCounters()
+    bootQuotaCheck()
   } catch (err) {
     console.error('[Settings GET] Failed to reconcile today counters:', err)
   }

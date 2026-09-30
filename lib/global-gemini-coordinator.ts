@@ -959,40 +959,37 @@ class GlobalGeminiCoordinator {
    * 1. Check Settings where usage data is stored!
    *    If actual used < cap, quota is STILL AVAILABLE today! NEVER mark as exhausted!
    * 2. Apply a randomized cooldown (70s - 78s) on that model so parallel scans don't wake up all at once.
-   * 3. Only mark definitively exhausted if real tracked usage has actually reached the daily cap (used >= cap).
+   * 3. Final decision is strictly from Settings quota: only mark exhausted if real tracked usage in Settings has reached the daily cap (used >= cap).
    */
   public handleQuotaOrRateError(
     apiKey: string,
     modelId: string,
     slot: number = 0,
     rpdCap?: number,
-    ..._extraArgs: unknown[]
+    keyIdx: number = 1,
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
     reason: string
   } {
-    void _extraArgs
     this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
     const cap = rpdCap ?? getModelDailyCap(modelId)
     const used = getModelUsage(modelId, apiKey)
 
-    // 1. Genuine daily exhaustion: ONLY if actual recorded usage in Settings has reached or exceeded cap!
+    // 1. FINAL DECISION: Only if actual recorded successful usage in Settings has reached or exceeded cap!
     if (used >= cap) {
       this.reportExhausted(apiKey, modelId, slot, cap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota limit reached in Settings (${used}/${cap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
+        reason: `Daily quota limit reached in Settings (${used}/${cap} RPD) on ${displayModelName(modelId)} (Key ${lane.keyIdx})`,
       }
     }
 
-    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
-
     // 2. CRITICAL USER RULE:
     // If usage in Settings is below cap, quota is STILL REMAINING for today!
-    // NEVER mark as exhausted for the day after 1, 2, or any number of rate/quota errors!
+    // Rate limit (429), repeated rate errors, or API hiccups must NEVER mark the model as exhausted!
     // Put ONLY this model in 70s-78s cooldown and allow retry when cooled down!
     lane.isExhausted = false
     clearModelExhausted(modelId, apiKey)
@@ -1001,7 +998,7 @@ class GlobalGeminiCoordinator {
     return {
       action: 'cooldown',
       waitSec: Math.ceil(jitterCooldownMs / 1000),
-      reason: `Rate limit (429) on ${modelId} (Key ${lane.keyIdx}). Quota remaining in Settings (${used}/${cap} RPD) — cooling down for ${Math.ceil(jitterCooldownMs / 1000)}s before retry`,
+      reason: `Rate limit (429) on ${displayModelName(modelId)} (Key ${lane.keyIdx}). Quota remaining in Settings (${used}/${cap} RPD) — cooling down for ${Math.ceil(jitterCooldownMs / 1000)}s before retry`,
     }
   }
 

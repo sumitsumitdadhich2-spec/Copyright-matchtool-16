@@ -176,12 +176,13 @@ export function getModelUsage(model: string, apiKey: string): number {
 
 export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap?: number): boolean {
   checkDailyReset()
-  const counters = getCachedCounters()
   const usage = getModelUsage(model, apiKey)
   const cap = rpdCap ?? getModelDailyCap(model)
-  // CRITICAL USER RULE: If usage in Settings is below model cap, quota is STILL AVAILABLE today!
+  // FINAL DECISION IS STRICTLY FROM SETTINGS QUOTA:
+  // If usage in Settings is below model cap, quota is STILL AVAILABLE today!
   // Clear any spurious exhaustion flag immediately and return false!
   if (usage < cap) {
+    const counters = getCachedCounters()
     if (counters[exhaustedKey(model, apiKey)]) {
       delete counters[exhaustedKey(model, apiKey)]
       saveCounters(counters)
@@ -192,12 +193,7 @@ export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap
 }
 
 export function getModelExhausted(model: string, apiKey: string, rpdCap?: number): boolean {
-  checkDailyReset()
-  const cap = rpdCap ?? getModelDailyCap(model)
-  const usage = getModelUsage(model, apiKey)
-  if (usage < cap) return false
-  const counters = getCachedCounters()
-  return counters[exhaustedKey(model, apiKey)] === true
+  return isModelDailyQuotaExhausted(model, apiKey, rpdCap)
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
@@ -232,7 +228,8 @@ export function setModelExhausted(model: string, apiKey: string, rpdCap?: number
   checkDailyReset()
   const cap = rpdCap ?? getModelDailyCap(model)
   const usage = getModelUsage(model, apiKey)
-  // CRITICAL USER RULE: Only mark exhausted if actual recorded usage in Settings has reached or exceeded cap!
+  // FINAL DECISION IS STRICTLY FROM SETTINGS QUOTA:
+  // Only mark exhausted if actual recorded usage in Settings has reached or exceeded cap!
   // If settings / store show usage < cap, quota is still remaining for the day!
   if (usage < cap) {
     // Quota still left in Settings — refuse to set exhausted flag and remove any old flag!
@@ -263,61 +260,79 @@ export function clearAllExhaustedFlags(): void {
 }
 
 /**
- * Reconciles today's counters directly from all recorded scans.
+ * Reconciles today's counters and clears any spurious exhaustion flags.
  * Ensures usage reflects ONLY genuine completed successful requests.
- * Clears spurious exhaustion flags if no scans exist or if actual usage < cap.
+ * Clears spurious exhaustion flags if actual usage in Settings < cap.
  */
 export function reconcileTodayCounters(): void {
   ensureDirs()
+  checkDailyReset()
   const today = todayKey()
   const counters = getCachedCounters()
 
-  // Clean all spurious exhaustion flags from previous days or unconfirmed states
-  for (const k of Object.keys(counters)) {
-    if (k.startsWith('_exh|') && !k.includes(`|${today}|`)) {
-      delete counters[k]
-    }
-  }
-
-  // Inspect existing scans
-  const scans = listScans()
-  const todayScans = scans.filter((s) => {
-    const d1 = geminiUsageDay(new Date(s.createdAt))
-    return d1 === today
-  })
-
-  if (todayScans.length === 0) {
-    // If no scans ran today, usage across all models is 0 and no model is exhausted!
-    for (const k of Object.keys(counters)) {
-      if (k.startsWith('_last')) continue
-      if (k.includes(`|${today}|`)) {
-        delete counters[k]
-      }
-    }
-    saveCounters(counters)
-    return
-  }
-
-  // If scans exist, verify exhaustion flags against actual RPD caps
+  // 1. Clean all exhaustion flags where recorded usage is below the model's daily cap
   for (const k of Object.keys(counters)) {
     if (k.startsWith('_exh|')) {
-      const parts = k.split('|')
-      if (parts.length >= 4) {
-        const model = parts[1]
-        const h = parts[3]
-        const m = MODEL_POOL.find((item) => item.id === model)
-        const rpd = m ? m.rpd : 20
-        const usageKey = `${model}|${today}|${h}`
-        const currentUsage = (counters[usageKey] as number) || 0
-        if (currentUsage < rpd) {
-          // If usage is below cap, it is not truly exhausted
-          delete counters[k]
+      if (!k.includes(`|${today}|`)) {
+        delete counters[k]
+      } else {
+        const parts = k.split('|')
+        if (parts.length >= 4) {
+          const model = parts[1]
+          const h = parts[3]
+          const m = MODEL_POOL.find((item) => item.id === model)
+          const cap = m ? m.rpd : getModelDailyCap(model)
+          const usageKey = `${model}|${today}|${h}`
+          const currentUsage = (typeof counters[usageKey] === 'number' ? (counters[usageKey] as number) : 0) || 0
+          if (currentUsage < cap) {
+            delete counters[k]
+          }
         }
       }
     }
   }
-
   saveCounters(counters)
+
+  // 2. Scan-level reconciliation: reset false 'exhausted' model states across all saved scans
+  try {
+    const scans = listScans()
+    for (const scan of scans) {
+      if (!scan.keyLanes || scan.keyLanes.length === 0) continue
+      let modified = false
+      for (const lane of scan.keyLanes) {
+        if (!lane.models) continue
+        const apiKey = getApiKeyN(lane.idx)
+        if (!apiKey) continue
+        for (const m of lane.models) {
+          const cap = getModelDailyCap(m.id)
+          const usage = getModelUsage(m.id, apiKey)
+          if (usage < cap && m.state === 'exhausted') {
+            m.state = 'idle'
+            modified = true
+          }
+        }
+      }
+      if (modified) {
+        saveScan(scan)
+      }
+    }
+  } catch (err) {
+    console.error('[reconcileTodayCounters] Error reconciling scans:', err)
+  }
+}
+
+/**
+ * Boot quota check: runs when the app starts up and when pages/scans initialize.
+ * Checks date rollover and purges any false exhaustion states so models are ready.
+ */
+export function bootQuotaCheck(): void {
+  try {
+    checkDailyReset()
+    reconcileTodayCounters()
+    console.log(`[App Boot Quota Check] Completed for ${todayKey()}. All models verified against Settings quota.`)
+  } catch (err) {
+    console.error('[bootQuotaCheck] Error during startup quota verification:', err)
+  }
 }
 
 export function resetAllDailyCounters(): void {
@@ -426,6 +441,22 @@ export function getScan(id: string): Scan | null {
   if (!Array.isArray(scan.candidateGroups)) scan.candidateGroups = []
   if (!Array.isArray(scan.logs)) scan.logs = []
 
+  // Ensure any model in keyLanes with usage < cap is active (not falsely exhausted)
+  if (Array.isArray(scan.keyLanes)) {
+    for (const lane of scan.keyLanes) {
+      if (!Array.isArray(lane.models)) continue
+      const apiKey = getApiKeyN(lane.idx)
+      if (!apiKey) continue
+      for (const m of lane.models) {
+        const cap = getModelDailyCap(m.id)
+        const usage = getModelUsage(m.id, apiKey)
+        if (usage < cap && m.state === 'exhausted') {
+          m.state = 'idle'
+        }
+      }
+    }
+  }
+
   // Backward compatibility: scans created before minute-wise scanning used
   // scan.chunks as their only chunk-state source. Expose that data as one
   // segment so old completed scans render consistently in every UI panel.
@@ -529,3 +560,9 @@ export function addLog(scan: Scan, level: LogEntry['level'], msg: string) {
   if (!Array.isArray(scan.logs)) scan.logs = []
   scan.logs.push({ t: Date.now(), level, msg })
 }
+
+// App startup quota verification: executes as soon as the module is loaded
+try {
+  bootQuotaCheck()
+} catch {}
+

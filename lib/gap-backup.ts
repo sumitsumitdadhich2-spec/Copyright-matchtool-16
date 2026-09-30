@@ -2,10 +2,10 @@ import 'server-only'
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
+import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay, bootQuotaCheck } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
-import { CHUNK_MODEL_POOL, GAP_FINDER_AVAILABLE_MODELS } from './models'
+import { CHUNK_MODEL_POOL, GAP_FINDER_AVAILABLE_MODELS, displayModelName } from './models'
 import { deleteFileQuiet, cleanupOrphanedGeminiFiles, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
@@ -134,6 +134,7 @@ export function startGapBackup(
   if (!scan.shortDuration || !scan.movieDuration || scan.awaitingTrim) return { ok: false, error: 'Upload both videos and confirm the movie trim first' }
   if (scan.gapBackup?.candidates.some((candidate) => candidate.review === 'pending')) return { ok: false, error: 'Review the pending Gemini candidates before retrying unresolved ranges' }
   if (!apiKeys.length) return { ok: false, error: 'Add a Gemini API key in Settings first' }
+  bootQuotaCheck()
   const isNewDay = checkDailyReset()
   if (isNewDay) {
     addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
@@ -455,26 +456,26 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               }
               queue.push(item)
               log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — disabled for this scan; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
-            } else if (e.kind === 'rpd') {
+            } else if (e.kind === 'rpd' || e.kind === 'rate') {
               const used = getModelUsage(lane.model.id, lane.key)
               if (used >= lane.model.rpd) {
                 setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
                 lane.dead = true
                 queue.push(item)
-                log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted in Settings (${used}/${lane.model.rpd} RPD) — model lane removed; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+                log(scan, 'warn', `Missing-scene finder: ${displayModelName(lane.model.id)} (key ${lane.keyIndex + 1}) daily quota reached in Settings (${used}/${lane.model.rpd} RPD) — model lane retired; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
               } else {
                 lane.cooldownUntil = Date.now() + 60_000 + Math.floor(Math.random() * 8000)
                 queue.push(item)
-                log(scan, 'warn', `Missing-scene finder: Rate limit on ${lane.model.id} (key ${lane.keyIndex + 1}). Quota remaining in Settings (${used}/${lane.model.rpd} RPD) — cooling down for 60s, chunk ${chunkIndex + 1} re-queued`)
+                log(scan, 'warn', `Missing-scene finder: Rate limit (429) on ${displayModelName(lane.model.id)} (key ${lane.keyIndex + 1}). Quota remaining in Settings (${used}/${lane.model.rpd} RPD) — cooling down for 60s, chunk ${chunkIndex + 1} re-queued`)
               }
             } else if (e.kind === 'empty') {
               lane.cooldownUntil = Date.now() + 3_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for alternative model`)
-            } else if (e.kind === 'rate' || is503OrBusyError(err)) {
+              log(scan, 'warn', `Missing-scene finder: Empty response on ${displayModelName(lane.model.id)} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for alternative model`)
+            } else if (is503OrBusyError(err)) {
               lane.cooldownUntil = Date.now() + 5_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / High demand on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
+              log(scan, 'warn', `Missing-scene finder: Server busy / High demand on ${displayModelName(lane.model.id)} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
             } else {
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts}/7 failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)

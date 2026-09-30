@@ -9,6 +9,7 @@ import { storageEnabled, storageHealthy } from '@/lib/storage'
 import { DATA_DIR, WORK_DIR, WORK_RAM_BUDGET_BYTES, MAX_SCANS } from '@/lib/paths'
 import { getFfmpegPathSync } from '@/lib/ffmpeg-bin'
 import { UPLOAD_PROTOCOL } from '@/lib/upload-protocol'
+import { bootQuotaCheck } from '@/lib/store'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -23,6 +24,7 @@ export const dynamic = 'force-dynamic'
  * being down only flags `degraded` (uploads/scans keep working from disk).
  */
 export async function GET(request: NextRequest) {
+  bootQuotaCheck()
   const authed = verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value) !== null
   bootWorkDirs()
   const pool = poolSnapshot()
